@@ -1,237 +1,14 @@
 """
 🍪 Produttivo Cookie Generator
-Com detecção inteligente de ambiente
+Frontend Streamlit → chama API no Render
 """
 
 import streamlit as st
-import asyncio
-import subprocess
-import sys
-import os
-import platform
+import requests
 from datetime import datetime
-from typing import Optional, Tuple
 
-# ========================================
-# DETECÇÃO DE AMBIENTE
-# ========================================
-
-@st.cache_resource
-def detectar_ambiente() -> dict:
-    """
-    Detecta o ambiente de execução e retorna informações
-    para guiar a instalação correta.
-    """
-    info = {
-        "sistema": platform.system(),           # Linux, Windows, Darwin
-        "python": sys.version,
-        "is_streamlit_cloud": os.path.exists("/mount/src"),
-        "is_colab": "COLAB_GPU" in os.environ or "COLAB_RELEASE_TAG" in os.environ,
-        "is_linux": platform.system() == "Linux",
-        "chromium_path": None,
-        "playwright_ok": False,
-    }
-
-    # Tenta encontrar Chromium já instalado no sistema
-    chromium_paths = [
-        "/usr/bin/chromium",
-        "/usr/bin/chromium-browser",
-        "/usr/bin/google-chrome",
-        "/usr/bin/google-chrome-stable",
-    ]
-
-    for path in chromium_paths:
-        if os.path.exists(path):
-            info["chromium_path"] = path
-            break
-
-    # Verifica se playwright já está instalado
-    try:
-        import playwright
-        info["playwright_ok"] = True
-    except ImportError:
-        info["playwright_ok"] = False
-
-    return info
-
-# ========================================
-# INSTALAÇÃO INTELIGENTE
-# ========================================
-
-@st.cache_resource
-def configurar_playwright() -> Tuple[bool, str]:
-    """
-    Instala Playwright de forma adequada para o ambiente detectado.
-    Roda apenas UMA VEZ graças ao @st.cache_resource.
-    """
-    env = detectar_ambiente()
-    logs = []
-
-    logs.append(f"🖥️ Sistema: {env['sistema']}")
-    logs.append(f"☁️ Streamlit Cloud: {env['is_streamlit_cloud']}")
-    logs.append(f"📓 Google Colab: {env['is_colab']}")
-    logs.append(f"🌐 Chromium no sistema: {env['chromium_path'] or 'Não encontrado'}")
-
-    try:
-        # PASSO 1: Instala pacote Python do Playwright
-        logs.append("📦 Instalando pacote playwright...")
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", "playwright", "-q"],
-            check=True,
-            capture_output=True
-        )
-        logs.append("✅ Pacote instalado!")
-
-        # PASSO 2: Estratégia de instalação do browser
-        if env["is_colab"]:
-            # No Colab: instala com deps de sistema
-            logs.append("📓 Ambiente Colab detectado - instalando com deps...")
-            subprocess.run(
-                ["playwright", "install", "chromium"],
-                check=True, capture_output=True
-            )
-            subprocess.run(
-                ["playwright", "install-deps", "chromium"],
-                check=True, capture_output=True
-            )
-
-        elif env["is_streamlit_cloud"]:
-            # No Streamlit Cloud: tenta instalar com --with-deps
-            logs.append("☁️ Streamlit Cloud detectado - instalando chromium...")
-            resultado = subprocess.run(
-                ["playwright", "install", "chromium", "--with-deps"],
-                capture_output=True,
-                text=True
-            )
-            if resultado.returncode != 0:
-                # Fallback: tenta sem --with-deps
-                logs.append("⚠️ Tentando instalação alternativa...")
-                subprocess.run(
-                    ["playwright", "install", "chromium"],
-                    check=True, capture_output=True
-                )
-
-        else:
-            # Local (Windows/Mac/Linux): instalação padrão
-            logs.append(f"💻 Ambiente local ({env['sistema']}) - instalação padrão...")
-            subprocess.run(
-                ["playwright", "install", "chromium"],
-                check=True, capture_output=True
-            )
-
-        logs.append("✅ Playwright configurado com sucesso!")
-        return True, "\n".join(logs)
-
-    except Exception as e:
-        logs.append(f"❌ Erro: {str(e)}")
-        return False, "\n".join(logs)
-
-# ========================================
-# LOGIN COM PLAYWRIGHT
-# ========================================
-
-def extrair_cookie_produttivo(cookie_header: str) -> Optional[str]:
-    """Extrai apenas o _produttivo_session"""
-    if cookie_header:
-        for par in cookie_header.split('; '):
-            if '=' in par:
-                nome, valor = par.split('=', 1)
-                if nome.strip() == '_produttivo_session':
-                    return valor
-    return None
-
-async def fazer_login(email: str, senha: str, log_callback=None) -> Optional[str]:
-    """Executa login e retorna cookie"""
-    from playwright.async_api import async_playwright
-
-    cookie_capturado = None
-
-    def log(msg):
-        if log_callback:
-            log_callback(msg)
-
-    async def capturar_request(request):
-        nonlocal cookie_capturado
-        if (request.url == "https://app.produttivo.com.br/works"
-                and request.method == "GET"
-                and cookie_capturado is None):
-            headers = await request.all_headers()
-            cookie_header = headers.get('cookie', '')
-            if cookie_header:
-                cookie_capturado = extrair_cookie_produttivo(cookie_header)
-                if cookie_capturado:
-                    log("🎯 Cookie capturado!")
-
-    try:
-        async with async_playwright() as p:
-
-            log("🚀 Iniciando navegador...")
-            browser = await p.chromium.launch(
-                headless=True,
-                args=[
-                    '--no-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--disable-gpu',
-                    '--single-process',
-                    '--disable-setuid-sandbox',
-                ]
-            )
-
-            context = await browser.new_context(
-                user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
-            )
-            context.set_default_timeout(60000)
-            page = await context.new_page()
-            page.on("request", capturar_request)
-
-            log("🌐 Acessando Produttivo...")
-            await page.goto(
-                "https://app.produttivo.com.br/auth/sign_in",
-                wait_until="domcontentloaded",
-                timeout=60000
-            )
-            await page.wait_for_timeout(3000)
-
-            log("📧 Preenchendo email...")
-            await page.wait_for_selector(
-                'input[type="email"], input[name="email"]',
-                timeout=30000
-            )
-            await page.fill('input[type="email"], input[name="email"]', email)
-            await page.wait_for_timeout(1000)
-
-            log("🔑 Preenchendo senha...")
-            await page.fill('input[type="password"]', senha)
-            await page.wait_for_timeout(2000)
-
-            log("🖱️ Enviando login...")
-            try:
-                await page.click('button:has-text("Login")', timeout=5000)
-            except:
-                try:
-                    await page.click('button[type="submit"]', timeout=5000)
-                except:
-                    await page.press('input[type="password"]', 'Enter')
-
-            log("⏳ Aguardando autenticação...")
-            await page.wait_for_timeout(8000)
-
-            url_atual = page.url
-            log(f"🔍 URL: {url_atual}")
-
-            if "sign_in" not in url_atual:
-                log("✅ Login bem-sucedido!")
-                await page.wait_for_timeout(3000)
-                await browser.close()
-                return cookie_capturado
-            else:
-                log("❌ Login falhou - verifique as credenciais")
-                await browser.close()
-                return None
-
-    except Exception as e:
-        log(f"❌ Erro no navegador: {str(e)}")
-        return None
+# URL da API no Render (atualizar após deploy)
+API_URL = st.secrets.get("API_URL", "https://sua-api.onrender.com")
 
 # ========================================
 # INTERFACE
@@ -247,27 +24,6 @@ def main():
     st.title("🍪 Produttivo Cookie Generator")
     st.markdown("**Login automático e captura de cookie**")
     st.markdown("---")
-
-    # Detecta ambiente
-    env = detectar_ambiente()
-
-    # Configura Playwright (só na primeira vez)
-    with st.spinner("⚙️ Verificando dependências..."):
-        ok, install_log = configurar_playwright()
-
-    if not ok:
-        st.error("❌ Falha ao configurar o navegador.")
-
-        with st.expander("🔍 Ver detalhes do erro"):
-            st.code(install_log, language="bash")
-            st.info(f"""
-            **Ambiente detectado:**
-            - Sistema: `{env['sistema']}`
-            - Streamlit Cloud: `{env['is_streamlit_cloud']}`
-            - Google Colab: `{env['is_colab']}`
-            - Chromium no sistema: `{env['chromium_path'] or 'Não encontrado'}`
-            """)
-        st.stop()
 
     # Sidebar
     with st.sidebar:
@@ -285,16 +41,6 @@ def main():
         )
 
         st.markdown("---")
-
-        # Info do ambiente
-        with st.expander("🖥️ Ambiente"):
-            st.caption(f"""
-            Sistema: `{env['sistema']}`
-            Streamlit Cloud: `{env['is_streamlit_cloud']}`
-            Colab: `{env['is_colab']}`
-            """)
-
-        st.markdown("---")
         st.info("""
         **Como funciona:**
         1. Preencha email e senha
@@ -302,6 +48,18 @@ def main():
         3. Aguarde ~30 segundos
         4. Copie o cookie!
         """)
+
+        # Status da API
+        st.markdown("---")
+        st.subheader("🔌 Status da API")
+        try:
+            resp = requests.get(f"{API_URL}/health", timeout=5)
+            if resp.status_code == 200:
+                st.success("✅ API online")
+            else:
+                st.error("❌ API com erro")
+        except:
+            st.error("❌ API offline")
 
         if st.session_state.get('ultima_execucao'):
             st.markdown("---")
@@ -326,25 +84,34 @@ def main():
             st.session_state['rodando'] = True
             st.session_state['cookie'] = None
 
-            st.markdown("### 📋 Log:")
-            log_area = st.empty()
-            logs = []
+            with st.spinner("🔄 Fazendo login no Produttivo... (~30 segundos)"):
+                try:
+                    response = requests.post(
+                        f"{API_URL}/gerar-cookie",
+                        json={"email": email, "senha": senha},
+                        timeout=120
+                    )
 
-            def adicionar_log(msg):
-                timestamp = datetime.now().strftime("%H:%M:%S")
-                logs.append(f"[{timestamp}] {msg}")
-                log_area.code("\n".join(logs), language="bash")
+                    if response.status_code == 200:
+                        data = response.json()
 
-            cookie = asyncio.run(fazer_login(email, senha, adicionar_log))
+                        if data["sucesso"]:
+                            st.session_state['cookie'] = data["cookie"]
+                            st.session_state['ultima_execucao'] = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+                        else:
+                            st.error(f"❌ {data['mensagem']}")
+                    else:
+                        st.error(f"❌ Erro na API: {response.status_code}")
+
+                except requests.exceptions.Timeout:
+                    st.error("❌ Timeout - o login demorou mais que 2 minutos")
+                except requests.exceptions.ConnectionError:
+                    st.error("❌ Não foi possível conectar à API. Verifique se está online.")
+                except Exception as e:
+                    st.error(f"❌ Erro: {str(e)}")
 
             st.session_state['rodando'] = False
-
-            if cookie:
-                st.session_state['cookie'] = cookie
-                st.session_state['ultima_execucao'] = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-                st.rerun()
-            else:
-                st.error("❌ Não foi possível capturar o cookie.")
+            st.rerun()
 
     with col2:
         st.header("📊 Status")
