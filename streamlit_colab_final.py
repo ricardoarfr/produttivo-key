@@ -1,7 +1,6 @@
 """
 🍪 Produttivo Cookie Generator
-Playwright direto no Streamlit Cloud
-Com cache inteligente para não reinstalar sempre
+Playwright com Chromium do sistema (packages.txt)
 """
 
 import streamlit as st
@@ -13,49 +12,41 @@ from datetime import datetime
 from typing import Optional
 
 # ========================================
-# CACHE DE INSTALAÇÃO DO PLAYWRIGHT
+# INSTALAÇÃO DO PLAYWRIGHT (UMA VEZ)
 # ========================================
 
 @st.cache_resource
-def instalar_playwright():
+def configurar_playwright():
     """
-    Instala Playwright UMA VEZ e mantém em cache.
-    @st.cache_resource garante que só roda na primeira vez
-    ou quando o servidor reinicia.
+    Instala playwright e aponta para o Chromium do sistema.
+    Roda apenas UMA VEZ graças ao @st.cache_resource.
     """
     try:
-        # Instala o pacote playwright
+        # Instala apenas o pacote Python do playwright (sem baixar browser)
         subprocess.run(
             [sys.executable, "-m", "pip", "install", "playwright", "-q"],
             check=True,
             capture_output=True
         )
 
-        # Instala o Chromium
-        subprocess.run(
-            ["playwright", "install", "chromium"],
-            check=True,
-            capture_output=True
+        # Instala apenas o chromium do playwright
+        resultado = subprocess.run(
+            ["playwright", "install", "chromium", "--with-deps"],
+            capture_output=True,
+            text=True
         )
 
-        # Instala dependências do sistema
-        subprocess.run(
-            ["playwright", "install-deps", "chromium"],
-            check=True,
-            capture_output=True
-        )
-
-        return True
+        return True, "Playwright configurado com sucesso"
 
     except Exception as e:
-        return False
+        return False, str(e)
 
 # ========================================
-# FUNÇÕES DE LOGIN
+# LOGIN COM PLAYWRIGHT
 # ========================================
 
 def extrair_cookie_produttivo(cookie_header: str) -> Optional[str]:
-    """Extrai apenas o _produttivo_session do header"""
+    """Extrai apenas o _produttivo_session"""
     if cookie_header:
         for par in cookie_header.split('; '):
             if '=' in par:
@@ -89,9 +80,15 @@ async def fazer_login(email: str, senha: str, log_callback=None) -> Optional[str
         async with async_playwright() as p:
 
             log("🚀 Iniciando navegador...")
+
             browser = await p.chromium.launch(
                 headless=True,
-                args=['--no-sandbox', '--disable-dev-shm-usage']
+                args=[
+                    '--no-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-gpu',
+                    '--single-process',
+                ]
             )
 
             context = await browser.new_context(
@@ -121,7 +118,7 @@ async def fazer_login(email: str, senha: str, log_callback=None) -> Optional[str
             await page.fill('input[type="password"]', senha)
             await page.wait_for_timeout(2000)
 
-            log("🖱️ Clicando em login...")
+            log("🖱️ Enviando login...")
             try:
                 await page.click('button:has-text("Login")', timeout=5000)
             except:
@@ -134,7 +131,7 @@ async def fazer_login(email: str, senha: str, log_callback=None) -> Optional[str
             await page.wait_for_timeout(8000)
 
             url_atual = page.url
-            log(f"🔍 URL atual: {url_atual}")
+            log(f"🔍 URL: {url_atual}")
 
             if "sign_in" not in url_atual:
                 log("✅ Login bem-sucedido!")
@@ -142,7 +139,7 @@ async def fazer_login(email: str, senha: str, log_callback=None) -> Optional[str
                 await browser.close()
                 return cookie_capturado
             else:
-                log("❌ Login falhou - verifique suas credenciais")
+                log("❌ Login falhou - verifique as credenciais")
                 await browser.close()
                 return None
 
@@ -151,7 +148,7 @@ async def fazer_login(email: str, senha: str, log_callback=None) -> Optional[str
         return None
 
 # ========================================
-# INTERFACE STREAMLIT
+# INTERFACE
 # ========================================
 
 def main():
@@ -165,11 +162,11 @@ def main():
     st.markdown("**Login automático e captura de cookie**")
     st.markdown("---")
 
-    # Instala Playwright (só na primeira vez)
+    # Configura Playwright (só na primeira vez)
     with st.spinner("⚙️ Verificando dependências..."):
-        ok = instalar_playwright()
+        ok, msg = configurar_playwright()
         if not ok:
-            st.error("❌ Falha ao instalar Playwright. Tente recarregar a página.")
+            st.error(f"❌ Falha ao configurar: {msg}")
             st.stop()
 
     # Sidebar
@@ -193,13 +190,12 @@ def main():
         1. Preencha email e senha
         2. Clique em "Gerar Cookie"
         3. Aguarde ~30 segundos
-        4. Copie o cookie gerado!
+        4. Copie o cookie!
         """)
 
-        # Última execução
         if st.session_state.get('ultima_execucao'):
             st.markdown("---")
-            st.caption(f"🕐 Último cookie gerado:\n{st.session_state['ultima_execucao']}")
+            st.caption(f"🕐 Último gerado:\n{st.session_state['ultima_execucao']}")
 
     # Área principal
     col1, col2 = st.columns([2, 1])
@@ -211,12 +207,15 @@ def main():
             st.warning("⚠️ Preencha email e senha na barra lateral")
             st.stop()
 
-        if st.button("🎯 GERAR COOKIE", type="primary", use_container_width=True,
-                     disabled=st.session_state.get('rodando', False)):
-
+        if st.button(
+            "🎯 GERAR COOKIE",
+            type="primary",
+            use_container_width=True,
+            disabled=st.session_state.get('rodando', False)
+        ):
             st.session_state['rodando'] = True
+            st.session_state['cookie'] = None
 
-            # Container de logs
             st.markdown("### 📋 Log:")
             log_area = st.empty()
             logs = []
@@ -226,7 +225,6 @@ def main():
                 logs.append(f"[{timestamp}] {msg}")
                 log_area.code("\n".join(logs), language="bash")
 
-            # Executa login
             cookie = asyncio.run(fazer_login(email, senha, adicionar_log))
 
             st.session_state['rodando'] = False
@@ -236,7 +234,7 @@ def main():
                 st.session_state['ultima_execucao'] = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
                 st.rerun()
             else:
-                st.error("❌ Não foi possível capturar o cookie. Verifique os logs acima.")
+                st.error("❌ Não foi possível capturar o cookie.")
 
     with col2:
         st.header("📊 Status")
@@ -248,7 +246,7 @@ def main():
         else:
             st.info("⏳ Aguardando execução")
 
-    # Exibe cookie capturado
+    # Exibe cookie
     if st.session_state.get('cookie') and not st.session_state.get('rodando'):
         st.markdown("---")
         st.header("🍪 Cookie Capturado")
@@ -259,9 +257,9 @@ def main():
 
         with col1:
             st.download_button(
-                label="💾 Download como .txt",
+                label="💾 Download .txt",
                 data=st.session_state['cookie'],
-                file_name=f"cookie_produttivo_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                file_name=f"cookie_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
                 mime="text/plain",
                 use_container_width=True
             )
@@ -272,14 +270,13 @@ def main():
                 st.rerun()
 
     st.markdown("---")
-    st.caption("🔐 Suas credenciais são usadas apenas para autenticação e não são armazenadas")
+    st.caption("🔐 Credenciais usadas apenas para autenticação e não armazenadas")
 
 # ========================================
 # EXECUÇÃO
 # ========================================
 
 if __name__ == "__main__":
-    # Inicializa session state
     if 'cookie' not in st.session_state:
         st.session_state['cookie'] = None
     if 'rodando' not in st.session_state:
