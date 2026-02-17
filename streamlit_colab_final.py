@@ -1,87 +1,127 @@
 """
 🍪 Produttivo Cookie Generator
 Interface Streamlit + Google Colab API
+OAuth via URL (compatível com Streamlit Cloud)
 """
 
 import streamlit as st
-import os
 import json
 import time
-from datetime import datetime
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
-from googleapiclient.errors import HttpError
 import io
 import requests
-import pickle
+from datetime import datetime
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import Flow
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
+from googleapiclient.errors import HttpError
 
 # ========================================
 # CONFIGURAÇÕES
 # ========================================
 
 SCOPES = [
-    'https://www.googleapis.com/auth/drive',
     'https://www.googleapis.com/auth/drive.file'
 ]
 
-# URL do notebook no GitHub
-GITHUB_NOTEBOOK_URL = "https://raw.githubusercontent.com/ricardoarfr/produttivo-app/main/login_cookie.ipynb"
+GITHUB_NOTEBOOK_URL = "https://raw.githubusercontent.com/ricardoarfr/produttivo-key/main/login_cookie.ipynb"
 
-CREDENTIALS_FILE = 'token.pickle'
+REDIRECT_URI = "https://rf-extractor-key.streamlit.app/"
 
 # ========================================
-# FUNÇÕES DE AUTENTICAÇÃO
+# FUNÇÕES DE AUTENTICAÇÃO OAUTH (SEM BROWSER)
 # ========================================
 
-def get_credentials():
-    """Obtém credenciais OAuth do Streamlit Secrets"""
-    creds = None
-    
-    # Tenta carregar credenciais salvas
-    if os.path.exists(CREDENTIALS_FILE):
-        with open(CREDENTIALS_FILE, 'rb') as token:
-            creds = pickle.load(token)
-    
-    # Se não tem credenciais válidas, faz novo login
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            try:
-                creds.refresh(Request())
-            except:
-                creds = None
-        
-        if not creds:
-            # Usa credenciais do Streamlit Secrets
-            client_config = {
-                "installed": {
-                    "client_id": st.secrets["GOOGLE_CLIENT_ID"],
-                    "client_secret": st.secrets["GOOGLE_CLIENT_SECRET"],
-                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                    "token_uri": "https://oauth2.googleapis.com/token",
-                    "redirect_uris": ["urn:ietf:wg:oauth:2.0:oob", "http://localhost"]
-                }
-            }
-            
-            flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
-            creds = flow.run_local_server(port=0)
-            
-            # Salva credenciais
-            with open(CREDENTIALS_FILE, 'wb') as token:
-                pickle.dump(creds, token)
-    
+def get_oauth_flow():
+    """Cria o fluxo OAuth com configurações do Streamlit Secrets"""
+    client_config = {
+        "web": {
+            "client_id": st.secrets["GOOGLE_CLIENT_ID"],
+            "client_secret": st.secrets["GOOGLE_CLIENT_SECRET"],
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": [REDIRECT_URI]
+        }
+    }
+
+    flow = Flow.from_client_config(
+        client_config,
+        scopes=SCOPES,
+        redirect_uri=REDIRECT_URI
+    )
+
+    return flow
+
+def get_auth_url():
+    """Gera URL de autorização OAuth"""
+    flow = get_oauth_flow()
+    auth_url, state = flow.authorization_url(
+        access_type='offline',
+        include_granted_scopes='true',
+        prompt='consent'
+    )
+    st.session_state['oauth_state'] = state
+    return auth_url
+
+def exchange_code_for_token(code):
+    """Troca o código de autorização por token de acesso"""
+    flow = get_oauth_flow()
+    flow.fetch_token(code=code)
+    return flow.credentials
+
+def get_credentials_from_session():
+    """Recupera credenciais salvas na session"""
+    if 'google_credentials' not in st.session_state:
+        return None
+
+    creds_data = st.session_state['google_credentials']
+    creds = Credentials(
+        token=creds_data['token'],
+        refresh_token=creds_data.get('refresh_token'),
+        token_uri=creds_data['token_uri'],
+        client_id=creds_data['client_id'],
+        client_secret=creds_data['client_secret'],
+        scopes=creds_data['scopes']
+    )
     return creds
 
-def authenticate_drive():
-    """Autentica no Google Drive"""
-    try:
-        creds = get_credentials()
-        service = build('drive', 'v3', credentials=creds)
-        return service
-    except Exception as e:
-        st.error(f"❌ Erro na autenticação: {e}")
-        return None
+def save_credentials_to_session(creds):
+    """Salva credenciais na session do Streamlit"""
+    st.session_state['google_credentials'] = {
+        'token': creds.token,
+        'refresh_token': creds.refresh_token,
+        'token_uri': creds.token_uri,
+        'client_id': creds.client_id,
+        'client_secret': creds.client_secret,
+        'scopes': list(creds.scopes) if creds.scopes else SCOPES
+    }
+
+def is_authenticated():
+    """Verifica se usuário está autenticado"""
+    return 'google_credentials' in st.session_state
+
+# ========================================
+# CAPTURA DO CÓDIGO OAUTH NA URL
+# ========================================
+
+def check_oauth_callback():
+    """Verifica se há código OAuth na URL e processa"""
+    query_params = st.query_params
+
+    if 'code' in query_params and not is_authenticated():
+        code = query_params['code']
+
+        with st.spinner("🔄 Finalizando autenticação..."):
+            try:
+                creds = exchange_code_for_token(code)
+                save_credentials_to_session(creds)
+                st.query_params.clear()
+                st.success("✅ Autenticado com sucesso!")
+                time.sleep(1)
+                st.rerun()
+
+            except Exception as e:
+                st.error(f"❌ Erro ao autenticar: {e}")
 
 # ========================================
 # FUNÇÕES DO GOOGLE DRIVE
@@ -90,70 +130,65 @@ def authenticate_drive():
 def download_notebook_from_github():
     """Baixa notebook do GitHub"""
     try:
-        response = requests.get(GITHUB_NOTEBOOK_URL)
+        response = requests.get(GITHUB_NOTEBOOK_URL, timeout=15)
         response.raise_for_status()
         return response.text
     except Exception as e:
-        st.error(f"❌ Erro ao baixar notebook: {e}")
+        st.error(f"❌ Erro ao baixar notebook do GitHub: {e}")
         return None
 
-def create_colab_notebook(service, notebook_content, email, senha):
+def create_colab_notebook(creds, notebook_content, email, senha):
     """Cria notebook no Google Drive com credenciais injetadas"""
-    
+
     # Parse do notebook
     notebook_json = json.loads(notebook_content)
-    
-    # Injeta credenciais na última célula
+
+    # Injeta credenciais na célula correta
     for cell in notebook_json['cells']:
-        if 'EMAIL' in cell.get('source', [''])[0]:
-            # Substitui credenciais
-            new_source = []
-            for line in cell['source']:
-                line = line.replace('EMAIL = "financeiro@rfsolucoestelecom.com.br"', 
-                                  f'EMAIL = "{email}"')
-                line = line.replace('SENHA = "Novo*789"', 
-                                  f'SENHA = "{senha}"')
-                new_source.append(line)
+        source = cell.get('source', '')
+        if isinstance(source, list):
+            source_str = ''.join(source)
+        else:
+            source_str = source
+
+        if 'EMAIL' in source_str and 'SENHA' in source_str:
+            new_source = source_str.replace(
+                'EMAIL = "financeiro@rfsolucoestelecom.com.br"',
+                f'EMAIL = "{email}"'
+            ).replace(
+                'SENHA = "Novo*789"',
+                f'SENHA = "{senha}"'
+            )
             cell['source'] = new_source
-    
-    # Converte de volta para string
-    modified_content = json.dumps(notebook_json, indent=2)
-    
-    # Cria arquivo temporário
+
+    modified_content = json.dumps(notebook_json, indent=2).encode('utf-8')
+
+    # Cria serviço do Drive
+    service = build('drive', 'v3', credentials=creds)
+
     file_metadata = {
         'name': f'login_produttivo_{datetime.now().strftime("%Y%m%d_%H%M%S")}.ipynb',
         'mimeType': 'application/vnd.google.colaboratory'
     }
-    
-    # Upload
-    media = MediaFileUpload(
-        io.BytesIO(modified_content.encode()),
+
+    media = MediaIoBaseUpload(
+        io.BytesIO(modified_content),
         mimetype='application/vnd.google.colaboratory',
         resumable=True
     )
-    
+
     try:
         file = service.files().create(
             body=file_metadata,
             media_body=media,
             fields='id, webViewLink'
         ).execute()
-        
-        return file
-    except HttpError as error:
-        st.error(f"❌ Erro ao criar notebook: {error}")
-        return None
 
-def get_notebook_output(service, file_id):
-    """Tenta extrair output do notebook (limitação: não é trivial via API)"""
-    
-    # NOTA: A API do Google Drive não fornece acesso direto aos outputs
-    # de execução de notebooks Colab. Precisamos de uma abordagem diferente.
-    
-    st.warning("⚠️ A API do Google Colab não permite execução automática direta.")
-    st.info("💡 O notebook foi criado no seu Google Drive. Você precisa abri-lo manualmente no Colab para executar.")
-    
-    return None
+        return file
+
+    except HttpError as error:
+        st.error(f"❌ Erro ao criar notebook no Drive: {error}")
+        return None
 
 # ========================================
 # INTERFACE STREAMLIT
@@ -165,161 +200,146 @@ def main():
         page_icon="🍪",
         layout="wide"
     )
-    
-    # CSS
-    st.markdown("""
-    <style>
-    .big-button {
-        font-size: 20px;
-        font-weight: bold;
-        padding: 20px;
-    }
-    </style>
-    """, unsafe_allow_html=True)
-    
+
     st.title("🍪 Produttivo Cookie Generator")
     st.markdown("**Geração automática via Google Colab**")
     st.markdown("---")
-    
+
+    # Verifica callback OAuth
+    check_oauth_callback()
+
     # Sidebar
     with st.sidebar:
         st.header("⚙️ Configurações")
-        
+
         st.subheader("🔐 Credenciais Produttivo")
         email = st.text_input(
             "Email",
             value=st.secrets.get("PRODUTTIVO_EMAIL", ""),
-            type="default"
         )
         senha = st.text_input(
             "Senha",
             value=st.secrets.get("PRODUTTIVO_SENHA", ""),
             type="password"
         )
-        
+
         st.markdown("---")
-        
-        st.info("""
-        **Como funciona:**
-        
-        1. Clique em "Gerar Cookie"
-        2. Autentique com Google (primeira vez)
-        3. Notebook será criado no Drive
-        4. Abra o link do Colab
-        5. Execute o notebook
-        6. Copie o cookie gerado
-        """)
-        
-        st.markdown("---")
-        
-        # Check de configuração
-        if not st.secrets.get("GOOGLE_CLIENT_ID"):
-            st.error("❌ Configure GOOGLE_CLIENT_ID")
+
+        # Status Google OAuth
+        st.subheader("🔑 Google OAuth")
+        if is_authenticated():
+            st.success("✅ Autenticado!")
+            if st.button("🔓 Desconectar"):
+                del st.session_state['google_credentials']
+                st.rerun()
         else:
+            st.warning("⚠️ Não autenticado")
+
+        st.markdown("---")
+
+        # Status secrets
+        if st.secrets.get("GOOGLE_CLIENT_ID"):
             st.success("✅ Client ID configurado")
-        
-        if not st.secrets.get("GOOGLE_CLIENT_SECRET"):
-            st.error("❌ Configure GOOGLE_CLIENT_SECRET")
         else:
+            st.error("❌ GOOGLE_CLIENT_ID não configurado")
+
+        if st.secrets.get("GOOGLE_CLIENT_SECRET"):
             st.success("✅ Client Secret configurado")
-    
+        else:
+            st.error("❌ GOOGLE_CLIENT_SECRET não configurado")
+
     # Área principal
     col1, col2 = st.columns([2, 1])
-    
+
     with col1:
         st.header("🚀 Gerador de Cookie")
-        
-        if not email or not senha:
-            st.warning("⚠️ Preencha email e senha na barra lateral")
-            st.stop()
-        
-        if st.button("🎯 GERAR COOKIE", type="primary", use_container_width=True):
-            
-            with st.spinner("🔄 Processando..."):
-                
-                # 1. Autenticar no Google Drive
-                progress_text = st.empty()
-                progress_text.info("1️⃣ Autenticando no Google Drive...")
-                
-                service = authenticate_drive()
-                
-                if not service:
-                    st.error("❌ Falha na autenticação")
-                    st.stop()
-                
-                progress_text.success("✅ Autenticado com sucesso!")
-                time.sleep(1)
-                
-                # 2. Baixar notebook do GitHub
-                progress_text.info("2️⃣ Baixando notebook do GitHub...")
-                
-                notebook_content = download_notebook_from_github()
-                
-                if not notebook_content:
-                    st.error("❌ Falha ao baixar notebook")
-                    st.stop()
-                
-                progress_text.success("✅ Notebook baixado!")
-                time.sleep(1)
-                
-                # 3. Criar notebook no Drive
-                progress_text.info("3️⃣ Criando notebook no Google Colab...")
-                
-                colab_file = create_colab_notebook(service, notebook_content, email, senha)
-                
-                if not colab_file:
-                    st.error("❌ Falha ao criar notebook")
-                    st.stop()
-                
-                progress_text.success("✅ Notebook criado!")
-                
-                # 4. Exibir link
-                st.markdown("---")
-                st.success("✅ Notebook criado com sucesso!")
-                
+
+        # PASSO 1: Autenticar com Google
+        if not is_authenticated():
+            st.info("**Passo 1:** Autentique com sua conta Google para começar.")
+
+            if st.button("🔗 Autenticar com Google", type="primary", use_container_width=True):
+                auth_url = get_auth_url()
                 st.markdown(f"""
-                ### 📝 Próximos Passos:
-                
-                1. **Abra o notebook no Colab:**
-                   
-                   🔗 [{colab_file['webViewLink']}]({colab_file['webViewLink']})
-                
-                2. **Execute todas as células** (Runtime > Run all)
-                
-                3. **Copie o cookie** que aparece no final
-                
-                4. **Use o cookie** nas suas requisições!
+                ### Clique no link para autorizar:
+                👉 **[Autenticar com Google]({auth_url})**
+
+                Após autorizar, você voltará automaticamente para cá.
                 """)
-                
-                st.info("💡 **Dica:** O cookie será exibido entre as linhas de =======")
-    
+
+        # PASSO 2: Gerar cookie
+        else:
+            st.success("✅ Google autenticado! Pronto para gerar o cookie.")
+
+            if not email or not senha:
+                st.warning("⚠️ Preencha email e senha na barra lateral")
+                st.stop()
+
+            if st.button("🎯 GERAR COOKIE", type="primary", use_container_width=True):
+
+                progress = st.empty()
+
+                # Baixar notebook
+                progress.info("1️⃣ Baixando notebook do GitHub...")
+                notebook_content = download_notebook_from_github()
+
+                if not notebook_content:
+                    st.stop()
+
+                progress.success("✅ Notebook baixado!")
+                time.sleep(0.5)
+
+                # Criar no Drive
+                progress.info("2️⃣ Criando notebook no Google Colab...")
+                creds = get_credentials_from_session()
+                colab_file = create_colab_notebook(creds, notebook_content, email, senha)
+
+                if not colab_file:
+                    st.stop()
+
+                progress.empty()
+
+                # Resultado
+                st.success("🎉 Notebook criado com sucesso!")
+                st.markdown("---")
+
+                st.markdown(f"""
+                ### 📋 Próximos Passos:
+
+                **1. Abra o notebook no Colab:**
+
+                👉 [Clique aqui para abrir]({colab_file['webViewLink']})
+
+                **2. Execute todas as células:**
+                - Menu: `Runtime` → `Run all`
+                - Aguarde ~30 segundos
+
+                **3. Copie o cookie:**
+                - Aparece no final entre as linhas `══════`
+                """)
+
     with col2:
         st.header("📊 Status")
-        
-        # Verifica se está configurado
-        has_google_creds = bool(
-            st.secrets.get("GOOGLE_CLIENT_ID") and 
-            st.secrets.get("GOOGLE_CLIENT_SECRET")
-        )
-        
-        has_produttivo_creds = bool(email and senha)
-        
-        if has_google_creds and has_produttivo_creds:
-            st.success("✅ Tudo configurado!")
+
+        st.markdown("**Checklist:**")
+
+        if st.secrets.get("GOOGLE_CLIENT_ID") and st.secrets.get("GOOGLE_CLIENT_SECRET"):
+            st.success("✅ Google configurado")
         else:
-            st.warning("⚠️ Configuração incompleta")
-        
-        st.markdown("---")
-        
-        st.markdown("### 🔧 Requisitos:")
-        st.markdown(f"""
-        - {'✅' if has_google_creds else '❌'} Google OAuth configurado
-        - {'✅' if has_produttivo_creds else '❌'} Credenciais Produttivo
-        """)
-    
-    # Footer
+            st.error("❌ Google não configurado")
+
+        if is_authenticated():
+            st.success("✅ Google autenticado")
+        else:
+            st.warning("⏳ Aguardando autenticação")
+
+        if email and senha:
+            st.success("✅ Credenciais Produttivo")
+        else:
+            st.warning("⏳ Preencha email e senha")
+
     st.markdown("---")
-    st.caption("🔐 Seus dados são processados de forma segura via Google Cloud")
+    st.caption("🔐 Autenticação segura via Google OAuth 2.0")
 
 # ========================================
 # EXECUÇÃO
